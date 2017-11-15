@@ -45,6 +45,7 @@ import io.netty.util.NetUtil;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.FutureListener;
 import io.netty.util.concurrent.Promise;
 import io.netty.util.internal.EmptyArrays;
 import io.netty.util.internal.PlatformDependent;
@@ -67,6 +68,7 @@ import static io.netty.resolver.dns.DefaultDnsServerAddressStreamProvider.DNS_PO
 import static io.netty.resolver.dns.UnixResolverDnsServerAddressStreamProvider.parseEtcResolverFirstNdots;
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
 import static io.netty.util.internal.ObjectUtil.checkPositive;
+import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
 
 /**
  * A DNS-based {@link InetNameResolver}.
@@ -165,6 +167,7 @@ public class DnsNameResolver extends InetNameResolver {
                 }
             };
 
+    private final int queryRetries;
     private final long queryTimeoutMillis;
     private final int maxQueriesPerResolve;
     private final ResolvedAddressTypes resolvedAddressTypes;
@@ -193,6 +196,7 @@ public class DnsNameResolver extends InetNameResolver {
      * @param dnsQueryLifecycleObserverFactory used to generate new instances of {@link DnsQueryLifecycleObserver} which
      *                                         can be used to track metrics for DNS servers.
      * @param queryTimeoutMillis timeout of each DNS query in millis
+     * @param queryRetries number of retries for queries that failed because of IO error or timeout
      * @param resolvedAddressTypes the preferred address types
      * @param recursionDesired if recursion desired flag must be set
      * @param maxQueriesPerResolve the maximum allowed number of DNS queries for a given name resolution
@@ -215,6 +219,7 @@ public class DnsNameResolver extends InetNameResolver {
             DnsCache authoritativeDnsServerCache,
             DnsQueryLifecycleObserverFactory dnsQueryLifecycleObserverFactory,
             long queryTimeoutMillis,
+            int queryRetries,
             ResolvedAddressTypes resolvedAddressTypes,
             boolean recursionDesired,
             int maxQueriesPerResolve,
@@ -228,6 +233,7 @@ public class DnsNameResolver extends InetNameResolver {
             boolean decodeIdn) {
         super(eventLoop);
         this.queryTimeoutMillis = checkPositive(queryTimeoutMillis, "queryTimeoutMillis");
+        this.queryRetries = checkPositiveOrZero(queryRetries, "queryRetries");
         this.resolvedAddressTypes = resolvedAddressTypes != null ? resolvedAddressTypes : DEFAULT_RESOLVE_ADDRESS_TYPES;
         this.recursionDesired = recursionDesired;
         this.maxQueriesPerResolve = checkPositive(maxQueriesPerResolve, "maxQueriesPerResolve");
@@ -566,10 +572,10 @@ public class DnsNameResolver extends InetNameResolver {
      * Hook designed for extensibility so one can pass a different cache on each resolution attempt
      * instead of using the global one.
      */
-    protected void doResolve(String inetHost,
-                             DnsRecord[] additionals,
-                             Promise<InetAddress> promise,
-                             DnsCache resolveCache) throws Exception {
+    protected void doResolve(final String inetHost,
+                             final DnsRecord[] additionals,
+                             final Promise<InetAddress> promise,
+                             final DnsCache resolveCache) throws Exception {
         if (inetHost == null || inetHost.isEmpty()) {
             // If an empty hostname is used we should use "localhost", just like InetAddress.getByName(...) does.
             promise.setSuccess(loopbackAddress());
@@ -590,8 +596,32 @@ public class DnsNameResolver extends InetNameResolver {
             return;
         }
 
-        if (!doResolveCached(hostname, additionals, promise, resolveCache)) {
-            doResolveUncached(hostname, additionals, promise, resolveCache);
+        doResolveWithRetry(hostname, additionals, resolveCache, new FutureListener<InetAddress>() {
+            private int retries = queryRetries;
+
+            @Override
+            public void operationComplete(Future<InetAddress> future) throws Exception {
+                Throwable cause = future.cause();
+                if (cause == null) {
+                    promise.setSuccess(future.getNow());
+                } else if (cause.getCause() instanceof DnsNameResolverException && --retries > 0) {
+                    // Retry again
+                    doResolveWithRetry(hostname, additionals, resolveCache, this);
+                } else {
+                    promise.setFailure(cause);
+                }
+            }
+        });
+    }
+
+    private void doResolveWithRetry(final String hostname,
+                                    final DnsRecord[] additionals,
+                                    final DnsCache resolveCache, FutureListener<InetAddress> listener) {
+        Promise<InetAddress> resolvePromise = executor().newPromise();
+        resolvePromise.addListener(listener);
+
+        if (!doResolveCached(hostname, additionals, resolvePromise, resolveCache)) {
+            doResolveUncached(hostname, additionals, resolvePromise, resolveCache);
         }
     }
 
@@ -696,10 +726,10 @@ public class DnsNameResolver extends InetNameResolver {
      * Hook designed for extensibility so one can pass a different cache on each resolution attempt
      * instead of using the global one.
      */
-    protected void doResolveAll(String inetHost,
-                                DnsRecord[] additionals,
-                                Promise<List<InetAddress>> promise,
-                                DnsCache resolveCache) throws Exception {
+    protected void doResolveAll(final String inetHost,
+                                final DnsRecord[] additionals,
+                                final Promise<List<InetAddress>> promise,
+                                final DnsCache resolveCache) throws Exception {
         if (inetHost == null || inetHost.isEmpty()) {
             // If an empty hostname is used we should use "localhost", just like InetAddress.getAllByName(...) does.
             promise.setSuccess(Collections.singletonList(loopbackAddress()));
@@ -720,8 +750,32 @@ public class DnsNameResolver extends InetNameResolver {
             return;
         }
 
-        if (!doResolveAllCached(hostname, additionals, promise, resolveCache)) {
-            doResolveAllUncached(hostname, additionals, promise, resolveCache);
+        doResolveAllWithRetry(hostname, additionals, resolveCache, new FutureListener<List<InetAddress>>() {
+            private int retries = queryRetries;
+
+            @Override
+            public void operationComplete(Future<List<InetAddress>> future) throws Exception {
+                Throwable cause = future.cause();
+                if (cause == null) {
+                    promise.setSuccess(future.getNow());
+                } else if (cause.getCause() instanceof DnsNameResolverException && --retries > 0) {
+                    // Retry again
+                    doResolveAllWithRetry(hostname, additionals, resolveCache, this);
+                } else {
+                    promise.setFailure(cause);
+                }
+            }
+        });
+    }
+
+    private void doResolveAllWithRetry(final String hostname,
+                                    final DnsRecord[] additionals,
+                                    final DnsCache resolveCache, FutureListener<List<InetAddress>> listener) {
+        Promise<List<InetAddress>> resolvePromise = executor().newPromise();
+        resolvePromise.addListener(listener);
+
+        if (!doResolveAllCached(hostname, additionals, resolvePromise, resolveCache)) {
+            doResolveAllUncached(hostname, additionals, resolvePromise, resolveCache);
         }
     }
 

@@ -44,6 +44,7 @@ public final class DnsNameResolverBuilder {
     private Integer maxTtl;
     private Integer negativeTtl;
     private long queryTimeoutMillis = 5000;
+    private int queryRetries = 2;
     private ResolvedAddressTypes resolvedAddressTypes = DnsNameResolver.DEFAULT_RESOLVE_ADDRESS_TYPES;
     private boolean recursionDesired = true;
     private int maxQueriesPerResolve = 16;
@@ -160,6 +161,17 @@ public final class DnsNameResolverBuilder {
      */
     public DnsNameResolverBuilder queryTimeoutMillis(long queryTimeoutMillis) {
         this.queryTimeoutMillis = queryTimeoutMillis;
+        return this;
+    }
+
+    /**
+     * Sets the number of retries done if a query fails because of IO error or an timeout.
+     *
+     * @param queryRetries the number of retries
+     * @return {@code this}
+     */
+    public DnsNameResolverBuilder queryRetries(int queryRetries) {
+        this.queryRetries = queryRetries;
         return this;
     }
 
@@ -365,6 +377,7 @@ public final class DnsNameResolverBuilder {
                 authoritativeDnsServerCache,
                 dnsQueryLifecycleObserverFactory,
                 queryTimeoutMillis,
+                queryRetries,
                 resolvedAddressTypes,
                 recursionDesired,
                 maxQueriesPerResolve,
